@@ -70,7 +70,10 @@ apps = ["steam"]
 
 [launch]
 # Map app_id to the actual command to spawn
+# Can be a string (simple command) or an array (command with arguments)
 "chromium-example.com__-Default" = "example-web-app"
+"com.mitchellh.ghostty" = ["ghostty", "-e", "tmux"]
+"twitch" = ["gtk-launch", "twitch"]
 ```
 
 ## Session File

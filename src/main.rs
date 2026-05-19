@@ -1,65 +1,26 @@
 use std::{
    collections::HashMap,
-   fs,
-   io,
-   path::{
-      Path,
-      PathBuf,
-   },
+   fs, io,
+   path::{Path, PathBuf},
    sync::{
       Arc,
-      atomic::{
-         AtomicBool,
-         Ordering,
-      },
+      atomic::{AtomicBool, Ordering},
    },
    thread,
-   time::{
-      Duration,
-      Instant,
-   },
+   time::{Duration, Instant},
 };
 
-use anstyle::{
-   AnsiColor,
-   Color,
-   Style,
-};
-use clap::{
-   Parser,
-   builder,
-   crate_authors,
-};
+use anstyle::{AnsiColor, Color, Style};
+use clap::{Parser, builder, crate_authors};
 use color_eyre::eyre;
-use eyre::{
-   Context as _,
-   OptionExt as _,
-};
-use log::{
-   debug,
-   error,
-   info,
-   warn,
-};
+use eyre::{Context as _, OptionExt as _};
+use log::{debug, error, info, warn};
 use niri_ipc::{
-   Action,
-   Reply,
-   Request,
-   Response,
-   SizeChange,
-   Window,
-   Workspace,
-   WorkspaceReferenceArg,
+   Action, Reply, Request, Response, SizeChange, Window, Workspace, WorkspaceReferenceArg,
    socket::Socket,
 };
-use serde::{
-   Deserialize,
-   Serialize,
-};
-use signal_hook::{
-   consts::TERM_SIGNALS,
-   flag,
-};
+use serde::{Deserialize, Serialize};
+use signal_hook::{consts::TERM_SIGNALS, flag};
 use thiserror::Error;
 
 mod logger;
@@ -80,38 +41,76 @@ pub enum NiriError {
 
 type NiriResult<T> = Result<T, NiriError>;
 
+/// Launch command that can be specified as either an array of arguments or a single string.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum LaunchCommand {
+   /// Array of arguments (preferred for commands with arguments).
+   Args(Vec<String>),
+   /// Single string command (backward compatibility for simple commands).
+   /// If the string contains spaces, it will be split on whitespace.
+   Shell(String),
+}
+
+impl LaunchCommand {
+   /// Returns the command as a vector of arguments for spawning.
+   fn argv(&self) -> Vec<String> {
+      match self {
+         Self::Shell(s) => s.split_whitespace().map(String::from).collect(),
+         Self::Args(v) => v.clone(),
+      }
+   }
+
+   /// Returns a display string for logging/error messages.
+   fn display(&self) -> String {
+      match self {
+         Self::Shell(s) => s.clone(),
+         Self::Args(v) => v.join(" "),
+      }
+   }
+
+   /// Returns the first argument (program name) if available.
+   fn first(&self) -> Option<&str> {
+      match self {
+         Self::Shell(s) => s.split_whitespace().next(),
+         Self::Args(v) => v.first().map(String::as_str),
+      }
+   }
+}
+
 /// Window data for session persistence (excludes title field)
 #[derive(Serialize, Deserialize)]
 struct SessionWindow<'niri> {
-   id:               u64,
+   id: u64,
    /// The application id of the window, see <https://wayland-book.com/xdg-shell-basics/xdg-toplevel.html>
-   app_id:           Option<String>,
+   app_id: Option<String>,
    /// The launch command to spawn this window (mapped from `app_id` via config,
    /// otherwise `app_id` if no mapping exists)
-   launch_command:   Option<String>,
+   launch_command: Option<LaunchCommand>,
    /// Index of the workspace on the corresponding monitor
-   workspace_idx:    Option<u8>,
+   workspace_idx: Option<u8>,
    /// Name of the workspace, in case of a named workspace
-   workspace_name:   Option<&'niri str>,
+   workspace_name: Option<&'niri str>,
    /// Output the workspace is on
    workspace_output: Option<&'niri str>,
    /// Whether the window is focused or not
-   is_focused:       bool,
+   is_focused: bool,
    /// Window size (width, height) in logical pixels
    /// TODO: Remove [`Option`] in a month
    #[serde(default)]
-   window_size:      Option<(i32, i32)>,
+   window_size: Option<(i32, i32)>,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
    #[serde(default)]
-   skip:   Skip,
+   skip: Skip,
    /// Map `app_id` to actual launch command (e.g.,
    /// "thorium-discord.com__app-Default" -> "discord-web-app")
+   /// Can be either a string or an array of strings for commands with arguments.
    #[serde(default)]
-   launch: HashMap<String, String>,
+   launch: HashMap<String, LaunchCommand>,
 }
 
 #[derive(Deserialize, Default)]
@@ -170,11 +169,9 @@ fn niri_windows() -> NiriResult<Vec<Window>> {
       .map_err(NiriError::Reply)?
    {
       Response::Windows(windows) => Ok(windows),
-      other => {
-         Err(NiriError::Reply(format!(
-            "Unexpected response from Niri: {other:?}"
-         )))
-      },
+      other => Err(NiriError::Reply(format!(
+         "Unexpected response from Niri: {other:?}"
+      ))),
    }
 }
 
@@ -186,11 +183,9 @@ fn niri_workspaces() -> NiriResult<Vec<Workspace>> {
       .map_err(NiriError::Reply)?
    {
       Response::Workspaces(workspaces) => Ok(workspaces),
-      other => {
-         Err(NiriError::Reply(format!(
-            "Unexpected response from Niri: {other:?}"
-         )))
-      },
+      other => Err(NiriError::Reply(format!(
+         "Unexpected response from Niri: {other:?}"
+      ))),
    }
 }
 
@@ -237,8 +232,8 @@ fn find_workspace_for_window<'niri>(
 }
 
 struct SaveOptions<'a> {
-   file_path:  &'a Path,
-   config:     &'a Config,
+   file_path: &'a Path,
+   config: &'a Config,
    /// When true, an empty window list is treated as stale data (e.g. the
    /// compositor already tore down surfaces) and the existing session file
    /// is left untouched.
@@ -257,11 +252,12 @@ fn save_session(opts: &SaveOptions) -> eyre::Result<()> {
 
          // Map app_id to launch command if it exists in the config
          let launch_command = window.app_id.as_ref().and_then(|app_id| {
-            opts.config
+            opts
+               .config
                .launch
                .get(app_id)
                .cloned()
-               .or_else(|| Some(app_id.clone()))
+               .or_else(|| Some(LaunchCommand::Shell(app_id.clone())))
          });
 
          SessionWindow {
@@ -296,14 +292,15 @@ fn save_session(opts: &SaveOptions) -> eyre::Result<()> {
 }
 
 fn spawn_and_move_window<'niri>(
-   launch_command: &str,
+   launch_command: &LaunchCommand,
    app_id: &str,
    workspace_idx: Option<u8>,
    workspace_name: Option<&'niri str>,
    workspace_output: Option<&'niri str>,
    window_size: Option<(i32, i32)>,
 ) -> eyre::Result<()> {
-   let command = vec![launch_command.to_owned()];
+   let command = launch_command.argv();
+   let display = launch_command.display();
 
    let mut socket = Socket::connect().wrap_err("Failed to connect to Niri IPC socket")?;
 
@@ -312,7 +309,7 @@ fn spawn_and_move_window<'niri>(
       .map_err(NiriError::Send)?;
 
    let Reply::Ok(Response::Handled) = reply else {
-      error!("failed to spawn command `{launch_command}`");
+      error!("failed to spawn command `{display}`");
       return Ok(());
    };
 
@@ -336,7 +333,7 @@ fn spawn_and_move_window<'niri>(
 
       if let Some(output) = workspace_output
          && let Err(err) = socket.send(Request::Action(Action::MoveWindowToMonitor {
-            id:     Some(new_window.id),
+            id: Some(new_window.id),
             output: output.to_owned(),
          }))
       {
@@ -355,14 +352,14 @@ fn spawn_and_move_window<'niri>(
          .send(Request::Action(Action::MoveWindowToWorkspace {
             window_id: Some(new_window.id),
             reference: workspace_reference,
-            focus:     false,
+            focus: false,
          }))
          .map_err(NiriError::Send)?
          .map_err(NiriError::Reply)?;
 
       if let Some((width, height)) = window_size {
          if let Err(err) = socket.send(Request::Action(Action::SetWindowWidth {
-            id:     Some(new_window.id),
+            id: Some(new_window.id),
             change: SizeChange::SetFixed(width),
          })) {
             warn!(
@@ -372,7 +369,7 @@ fn spawn_and_move_window<'niri>(
          }
 
          if let Err(err) = socket.send(Request::Action(Action::SetWindowHeight {
-            id:     Some(new_window.id),
+            id: Some(new_window.id),
             change: SizeChange::SetFixed(height),
          })) {
             warn!(
@@ -385,15 +382,44 @@ fn spawn_and_move_window<'niri>(
       return Ok(());
    }
 
-   warn!("window for `{launch_command}` did not appear within 5s");
+   warn!("window for `{display}` did not appear within 5s");
 
    Ok(())
+}
+
+/// Checks if the launch command should be skipped based on skip config.
+fn should_skip(launch_command: &LaunchCommand, app_id: Option<&str>, skip_apps: &[String]) -> bool {
+   if skip_apps.is_empty() {
+      return false;
+   }
+
+   // Check if app_id is in skip list
+   if let Some(id) = app_id {
+      if skip_apps.contains(&id.to_string()) {
+         return true;
+      }
+   }
+
+   // Check display string (e.g., "ghostty -e tmux")
+   let display = launch_command.display();
+   if skip_apps.contains(&display) {
+      return true;
+   }
+
+   // Check first argument (program name)
+   if let Some(first) = launch_command.first() {
+      if skip_apps.contains(&first.to_string()) {
+         return true;
+      }
+   }
+
+   false
 }
 
 fn restore_session(config: &Config, session_path: &Path) -> eyre::Result<()> {
    if !session_path.exists() {
       save_session(&SaveOptions {
-         file_path:  session_path,
+         file_path: session_path,
          config,
          skip_empty: false,
       })?;
@@ -419,8 +445,8 @@ fn restore_session(config: &Config, session_path: &Path) -> eyre::Result<()> {
    for window in sorted_windows {
       // Check if the launch command should be skipped
       if let Some(ref launch_command) = window.launch_command {
-         if config.skip.apps.contains(launch_command) {
-            info!("skipping command: {launch_command}");
+         if should_skip(launch_command, window.app_id.as_deref(), &config.skip.apps) {
+            info!("skipping command: {}", launch_command.display());
             continue;
          }
 
@@ -506,8 +532,8 @@ fn main() -> eyre::Result<()> {
 
       if last_save.elapsed() >= Duration::from_secs(args.save_interval) {
          if let Err(report) = save_session(&SaveOptions {
-            file_path:  &session_path,
-            config:     &config,
+            file_path: &session_path,
+            config: &config,
             skip_empty: false,
          }) {
             error!("failed to save session: {report}");
@@ -518,8 +544,8 @@ fn main() -> eyre::Result<()> {
 
    info!("shutting down...");
    if let Err(report) = save_session(&SaveOptions {
-      file_path:  &session_path,
-      config:     &config,
+      file_path: &session_path,
+      config: &config,
       skip_empty: true,
    }) {
       error!("error saving final session: {report}");
